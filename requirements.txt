@@ -1,0 +1,5 @@
+aiogram>=3.4
+mcstatus>=11.0
+python-dotenv>=1.0
+bcrypt>=4.0
+pymysql>=1.1
