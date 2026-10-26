@@ -144,6 +144,9 @@ def _verify_password(password: str, stored: str) -> bool:
     return False
 
 
+LAST_ERROR = {"text": ""}
+
+
 async def check_server_password(nick: str, password: str) -> str:
     """Возвращает: ok | no_player | wrong | error"""
     try:
@@ -152,8 +155,9 @@ async def check_server_password(nick: str, password: str) -> str:
             return "no_player"
         ok = await asyncio.to_thread(_verify_password, password, row[0])
         return "ok" if ok else "wrong"
-    except Exception:
+    except Exception as e:
         logging.exception("Auth check failed")
+        LAST_ERROR["text"] = f"{type(e).__name__}: {e}"[:400]
         return "error"
 
 
@@ -317,7 +321,8 @@ async def reg_password(m: Message, state: FSMContext):
         await m.answer("❌ Неверный пароль. Попробуй ещё раз или нажми /start для отмены.")
     else:
         await state.clear()
-        await m.answer("Не удалось проверить пароль (ошибка связи с базой сервера). Сообщи администратору.")
+        extra = f"\n\nПричина: {LAST_ERROR['text']}" if os.getenv("DEBUG_ERRORS") == "1" else ""
+        await m.answer("Не удалось проверить пароль (ошибка связи с базой сервера). Сообщи администратору." + extra)
 
 
 @router.message(F.text == "👤 Профиль")
