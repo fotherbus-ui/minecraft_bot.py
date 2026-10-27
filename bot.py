@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     KeyboardButton,
     Message,
@@ -52,6 +53,10 @@ SFTP_PORT = int(os.getenv("SFTP_PORT", "22"))
 SFTP_USER = os.getenv("SFTP_USER", "")
 SFTP_PASSWORD = os.getenv("SFTP_PASSWORD", "")
 SFTP_STATS_DIR = os.getenv("SFTP_STATS_DIR", "world/stats")
+# Папки с файлами игроков (перебираются по очереди; у новых версий Minecraft путь другой)
+STATS_DIRS = [x.strip() for x in os.getenv("SFTP_STATS_DIRS", f"{SFTP_STATS_DIR},world/players/stats").split(",") if x.strip()]
+PLAYERDATA_DIRS = [x.strip() for x in os.getenv("SFTP_PLAYERDATA_DIRS", "world/playerdata,world/players/data").split(",") if x.strip()]
+PLAYERDATA_LOCAL_DIR = os.getenv("PLAYERDATA_DIR", "playerdata")
 
 # RCON для выдачи привилегий
 RCON_HOST = os.getenv("RCON_HOST", SERVER_HOST)
@@ -169,14 +174,17 @@ def offline_uuid(name: str) -> str:
     return str(uuid.UUID(bytes=bytes(h)))
 
 
-def _load_stats(nick: str) -> dict | None:
+def _player_uuid(nick: str) -> str:
     # UUID берём из базы плагина (он совпадает с UUID сервера), иначе считаем offline-UUID
     try:
         row = _fetch_auth_row(nick)
     except Exception:
         row = None
-    player_uuid = (row[1] if row and row[1] else None) or offline_uuid(nick)
-    fname = f"{player_uuid}.json"
+    return (row[1] if row and row[1] else None) or offline_uuid(nick)
+
+
+def _read_player_file(dirs: list[str], local_dir: str, fname: str) -> bytes | None:
+    """Читает файл игрока по SFTP (перебирая папки) или из локальной папки."""
     if SFTP_HOST:
         import paramiko
 
@@ -184,16 +192,22 @@ def _load_stats(nick: str) -> dict | None:
         try:
             transport.connect(username=SFTP_USER, password=SFTP_PASSWORD)
             sftp = paramiko.SFTPClient.from_transport(transport)
-            with sftp.open(f"{SFTP_STATS_DIR}/{fname}") as f:
-                return json.loads(f.read().decode())
-        except FileNotFoundError:
+            for d in dirs:
+                try:
+                    with sftp.open(f"{d}/{fname}") as f:
+                        return f.read()
+                except (FileNotFoundError, IOError):
+                    continue
             return None
         finally:
             transport.close()
-    path = Path(STATS_DIR) / fname
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    path = Path(local_dir) / fname
+    return path.read_bytes() if path.exists() else None
+
+
+def _load_stats(nick: str) -> dict | None:
+    raw = _read_player_file(STATS_DIRS, STATS_DIR, f"{_player_uuid(nick)}.json")
+    return json.loads(raw.decode("utf-8")) if raw else None
 
 
 async def get_player_stats(nick: str) -> dict | None:
@@ -216,6 +230,275 @@ async def get_player_stats(nick: str) -> dict | None:
         "mob_kills": custom.get("minecraft:mob_kills", 0),
         "jumps": custom.get("minecraft:jump", 0),
     }
+
+
+# ───────────────────────── Инвентарь (файл игрока .dat, формат NBT) ─────────────────────────
+def parse_nbt(data: bytes):
+    """Минимальный разбор NBT (gzip или без сжатия). Возвращает корневой compound как dict."""
+    import gzip
+    import struct
+
+    if data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    pos = 0
+
+    def take(n):
+        nonlocal pos
+        chunk = data[pos:pos + n]
+        pos += n
+        return chunk
+
+    def string():
+        (n,) = struct.unpack(">H", take(2))
+        return take(n).decode("utf-8", "replace")
+
+    def payload(tag):
+        if tag == 1:
+            return struct.unpack(">b", take(1))[0]
+        if tag == 2:
+            return struct.unpack(">h", take(2))[0]
+        if tag == 3:
+            return struct.unpack(">i", take(4))[0]
+        if tag == 4:
+            return struct.unpack(">q", take(8))[0]
+        if tag == 5:
+            return struct.unpack(">f", take(4))[0]
+        if tag == 6:
+            return struct.unpack(">d", take(8))[0]
+        if tag == 7:
+            (n,) = struct.unpack(">i", take(4))
+            return list(take(n))
+        if tag == 8:
+            return string()
+        if tag == 9:
+            (t,) = struct.unpack(">b", take(1))
+            (n,) = struct.unpack(">i", take(4))
+            return [payload(t) for _ in range(n)]
+        if tag == 10:
+            out = {}
+            while True:
+                (t,) = struct.unpack(">b", take(1))
+                if t == 0:
+                    return out
+                key = string()
+                out[key] = payload(t)
+        if tag == 11:
+            (n,) = struct.unpack(">i", take(4))
+            return list(struct.unpack(f">{n}i", take(4 * n)))
+        if tag == 12:
+            (n,) = struct.unpack(">i", take(4))
+            return list(struct.unpack(f">{n}q", take(8 * n)))
+        raise ValueError(f"unknown NBT tag {tag}")
+
+    (root_tag,) = struct.unpack(">b", take(1))
+    string()  # имя корня
+    return payload(root_tag)
+
+
+RU_ITEMS = {
+    "diamond": "Алмаз", "emerald": "Изумруд", "gold_ingot": "Золотой слиток", "iron_ingot": "Железный слиток",
+    "netherite_ingot": "Незеритовый слиток", "coal": "Уголь", "charcoal": "Древесный уголь", "stick": "Палка",
+    "apple": "Яблоко", "golden_apple": "Золотое яблоко", "enchanted_golden_apple": "Зачарованное золотое яблоко",
+    "bread": "Хлеб", "cooked_beef": "Жареная говядина", "cooked_porkchop": "Жареная свинина",
+    "torch": "Факел", "arrow": "Стрела", "bow": "Лук", "crossbow": "Арбалет", "shield": "Щит",
+    "elytra": "Элитры", "totem_of_undying": "Тотем бессмертия", "ender_pearl": "Жемчуг Эндера",
+    "experience_bottle": "Пузырёк опыта", "firework_rocket": "Фейерверк", "water_bucket": "Ведро воды",
+    "lava_bucket": "Ведро лавы", "bucket": "Ведро", "crafting_table": "Верстак", "furnace": "Печь",
+    "chest": "Сундук", "ender_chest": "Сундук Края", "shulker_box": "Шалкер", "obsidian": "Обсидиан",
+    "cobblestone": "Булыжник", "stone": "Камень", "dirt": "Земля", "sand": "Песок", "gravel": "Гравий",
+    "oak_log": "Дубовое бревно", "oak_planks": "Дубовые доски", "glass": "Стекло", "tnt": "TNT",
+    "diamond_sword": "Алмазный меч", "diamond_pickaxe": "Алмазная кирка", "diamond_axe": "Алмазный топор",
+    "diamond_shovel": "Алмазная лопата", "netherite_sword": "Незеритовый меч",
+    "netherite_pickaxe": "Незеритовая кирка", "iron_sword": "Железный меч", "iron_pickaxe": "Железная кирка",
+    "diamond_helmet": "Алмазный шлем", "diamond_chestplate": "Алмазный нагрудник",
+    "diamond_leggings": "Алмазные поножи", "diamond_boots": "Алмазные ботинки",
+    "netherite_helmet": "Незеритовый шлем", "netherite_chestplate": "Незеритовый нагрудник",
+    "netherite_leggings": "Незеритовые поножи", "netherite_boots": "Незеритовые ботинки",
+    "iron_helmet": "Железный шлем", "iron_chestplate": "Железный нагрудник",
+    "iron_leggings": "Железные поножи", "iron_boots": "Железные ботинки",
+    "redstone": "Красная пыль", "lapis_lazuli": "Лазурит", "bone": "Кость", "string": "Нить",
+    "leather": "Кожа", "wheat": "Пшеница", "carrot": "Морковь", "potato": "Картофель",
+    "command_block": "Командный блок", "barrier": "Барьер", "name_tag": "Бирка", "saddle": "Седло",
+}
+
+
+def item_name(item_id: str) -> str:
+    short = item_id.split(":", 1)[-1]
+    return RU_ITEMS.get(short, short.replace("_", " ").capitalize())
+
+
+# ───────────── Картинка инвентаря (иконки лежат в icons.zip рядом с bot.py) ─────────────
+ICONS_ZIP = Path(__file__).with_name("icons.zip")
+_icon_bytes: dict[str, bytes] | None = None
+_icon_cache: dict[str, object] = {}
+
+
+def _icon_for(item_id: str):
+    """PIL-картинка 16x16 для предмета или None, если иконки нет."""
+    global _icon_bytes
+    from PIL import Image
+
+    if _icon_bytes is None:
+        _icon_bytes = {}
+        if ICONS_ZIP.exists():
+            import zipfile
+
+            with zipfile.ZipFile(ICONS_ZIP) as z:
+                _icon_bytes = {n[:-4]: z.read(n) for n in z.namelist() if n.endswith(".png")}
+    short = item_id.split(":", 1)[-1]
+    if short in _icon_cache:
+        return _icon_cache[short]
+    img = None
+    for variant in (short, f"{short}_front", f"{short}_top", f"{short}_side", f"{short}_00"):
+        if variant in _icon_bytes:
+            import io
+
+            img = Image.open(io.BytesIO(_icon_bytes[variant])).convert("RGBA")
+            break
+    _icon_cache[short] = img
+    return img
+
+
+def _font(size: int):
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # старый Pillow
+        return ImageFont.load_default()
+
+
+def render_slots(slots: dict[int, tuple[str, int]], layout: list[list[int | None]]) -> bytes:
+    """Рисует сетку слотов. layout — строки со списком номеров слотов (None — пустое место)."""
+    import io
+
+    from PIL import Image, ImageDraw
+
+    cell, pad, icon_px = 64, 8, 48
+    cols = max(len(r) for r in layout)
+    w = cols * cell + pad * 2
+    h = len(layout) * cell + pad * 2
+    img = Image.new("RGBA", (w, h), (198, 198, 198, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, w - 1, h - 1], outline=(85, 85, 85, 255), width=3)
+    font = _font(20)
+    for r, row in enumerate(layout):
+        for c, slot in enumerate(row):
+            if slot is None:
+                continue
+            x, y = pad + c * cell, pad + r * cell
+            d.rectangle([x, y, x + cell - 2, y + cell - 2], fill=(139, 139, 139, 255), outline=(55, 55, 55, 255), width=2)
+            if slot not in slots:
+                continue
+            item_id, count = slots[slot]
+            ic = _icon_for(item_id)
+            if ic is not None:
+                ic = ic.resize((icon_px, icon_px), Image.NEAREST)
+                img.alpha_composite(ic, (x + (cell - icon_px) // 2 - 1, y + (cell - icon_px) // 2 - 1))
+            else:  # иконки нет — плитка с буквами названия
+                hsh = sum(ord(ch) for ch in item_id)
+                color = (60 + hsh * 7 % 140, 60 + hsh * 13 % 140, 60 + hsh * 29 % 140, 255)
+                d.rectangle([x + 8, y + 8, x + cell - 10, y + cell - 10], fill=color)
+                short = item_id.split(":", 1)[-1].replace("_", " ")
+                d.text((x + cell // 2 - 1, y + cell // 2 - 1), short[:2].upper(), fill="white", font=font, anchor="mm")
+            if count > 1:
+                tx, ty = x + cell - 6, y + cell - 4
+                d.text((tx + 2, ty + 2), str(count), fill=(55, 55, 55, 255), font=font, anchor="rd")
+                d.text((tx, ty), str(count), fill="white", font=font, anchor="rd")
+    out = io.BytesIO()
+    img.convert("RGB").save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+def render_inventory(items: list[tuple[int, str, int]]) -> bytes:
+    slots = {s: (i, c) for s, i, c in items}
+    layout = [
+        [103, 102, 101, 100, None, -106, None, None, None],  # шлем, нагрудник, поножи, ботинки, левая рука
+        *[[9 + r * 9 + c for c in range(9)] for r in range(3)],  # основной инвентарь
+        [0, 1, 2, 3, 4, 5, 6, 7, 8],  # хотбар
+    ]
+    return render_slots(slots, layout)
+
+
+def render_ender(items: list[tuple[int, str, int]]) -> bytes:
+    slots = {s: (i, c) for s, i, c in items}
+    return render_slots(slots, [[r * 9 + c for c in range(9)] for r in range(3)])
+
+
+def _items_of(lst) -> list[tuple[int, str, int]]:
+    """[(слот, id, количество)] — поддерживает старый (Count/byte) и новый (count/int) формат."""
+    out = []
+    for it in lst or []:
+        if not isinstance(it, dict) or "id" not in it:
+            continue
+        count = it.get("count", it.get("Count", 1))
+        out.append((it.get("Slot", 0), it["id"], int(count)))
+    return out
+
+
+def _spawn_and_pos(root: dict) -> tuple[str | None, str | None]:
+    def fmt(x, y, z):
+        return f"X {int(x)}, Y {int(y)}, Z {int(z)}"
+
+    spawn = None
+    resp = root.get("respawn")  # новые версии
+    if isinstance(resp, dict):
+        p = resp.get("pos") or resp.get("position")
+        if isinstance(p, list) and len(p) >= 3:
+            spawn = fmt(*p[:3]) + f" ({resp.get('dimension', 'minecraft:overworld').split(':')[-1]})"
+    if spawn is None and "SpawnX" in root:  # старые версии
+        spawn = fmt(root["SpawnX"], root.get("SpawnY", 0), root["SpawnZ"]) + \
+            f" ({str(root.get('SpawnDimension', 'minecraft:overworld')).split(':')[-1]})"
+    pos = root.get("Pos")
+    where = None
+    if isinstance(pos, list) and len(pos) >= 3:
+        where = fmt(*pos[:3]) + f" ({str(root.get('Dimension', 'minecraft:overworld')).split(':')[-1]})"
+    return spawn, where
+
+
+def _load_inventory(nick: str) -> dict | None:
+    raw = _read_player_file(PLAYERDATA_DIRS, PLAYERDATA_LOCAL_DIR, f"{_player_uuid(nick)}.dat")
+    if not raw:
+        return None
+    root = parse_nbt(raw)
+    inv = _items_of(root.get("Inventory"))
+    ender = _items_of(root.get("EnderItems"))
+    spawn, where = _spawn_and_pos(root)
+    return {"inv": inv, "ender": ender, "spawn": spawn, "pos": where}
+
+
+def _summarize(items: list[tuple[int, str, int]], limit: int = 40) -> tuple[str, int, int]:
+    """Строка со списком предметов, всего предметов, занято слотов."""
+    total = sum(c for _, _, c in items)
+    agg: dict[str, int] = {}
+    for _, iid, c in items:
+        agg[iid] = agg.get(iid, 0) + c
+    rows = sorted(agg.items(), key=lambda kv: -kv[1])
+    lines = [f"• {item_name(i)} ×{c}" for i, c in rows[:limit]]
+    if len(rows) > limit:
+        lines.append(f"…и ещё {len(rows) - limit} видов")
+    return ("\n".join(lines) if lines else "пусто"), total, len(items)
+
+
+def format_inventory(nick: str, d: dict) -> str:
+    armor_slots = {103: "Шлем", 102: "Нагрудник", 101: "Поножи", 100: "Ботинки", -106: "Левая рука"}
+    armor = [(s, i, c) for s, i, c in d["inv"] if s in armor_slots]
+    main = [(s, i, c) for s, i, c in d["inv"] if s not in armor_slots]
+    body, total, used = _summarize(main)
+    ender_body, e_total, e_used = _summarize(d["ender"])
+    parts = [
+        f"🎒 <b>Инвентарь {nick}</b>",
+        f"📍 Точка спавна: {d['spawn'] or 'не задана (нет кровати/якоря возрождения)'}",
+        f"🧭 Последняя позиция: {d['pos'] or 'неизвестна'}",
+        "",
+        f"<b>Инвентарь</b> — всего предметов: <b>{total}</b>, занято слотов: {used}/36",
+        body,
+    ]
+    if armor:
+        parts += ["", "<b>Броня и левая рука</b>"]
+        parts += [f"• {armor_slots[s]}: {item_name(i)}" + (f" ×{c}" if c > 1 else "") for s, i, c in sorted(armor, reverse=True)]
+    parts += ["", f"<b>Эндер-сундук</b> — всего предметов: <b>{e_total}</b>, занято слотов: {e_used}/27", ender_body]
+    return "\n".join(parts)
 
 
 # ───────────────────────── Сервер / RCON ─────────────────────────
@@ -345,7 +628,44 @@ async def profile(m: Message):
         ).replace(",", " ")
     else:
         text += "Статистика пока недоступна (игрок ещё не играл или не настроен доступ к stats)."
-    await m.answer(text, parse_mode="HTML")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎒 Инвентарь", callback_data="inv")
+    await m.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "inv")
+async def inventory(cb: CallbackQuery):
+    user = get_user(cb.from_user.id)
+    if not user:
+        await cb.answer("Сначала /register", show_alert=True)
+        return
+    await cb.answer()
+    try:
+        data = await asyncio.to_thread(_load_inventory, user["nick"])
+    except Exception as e:
+        logging.exception("inventory failed")
+        extra = f"\n{type(e).__name__}: {e}"[:300] if os.getenv("DEBUG_ERRORS") == "1" else ""
+        await cb.message.answer("Не удалось прочитать инвентарь с сервера." + extra)
+        return
+    if data is None:
+        await cb.message.answer(
+            "Файл игрока на сервере не найден. Зайди на сервер хотя бы раз; "
+            "если уже заходил — администратору нужно проверить доступ по SFTP."
+        )
+        return
+    try:  # картинки (если не получилось — остаётся текстовый список ниже)
+        inv_png, ender_png = await asyncio.gather(
+            asyncio.to_thread(render_inventory, data["inv"]),
+            asyncio.to_thread(render_ender, data["ender"]),
+        )
+        await cb.message.answer_photo(BufferedInputFile(inv_png, "inventory.png"), caption=f"🎒 Инвентарь {user['nick']}")
+        await cb.message.answer_photo(BufferedInputFile(ender_png, "ender.png"), caption="🟣 Эндер-сундук")
+    except Exception:
+        logging.exception("render failed")
+    text = format_inventory(user["nick"], data)
+    for i in range(0, len(text), 4000):  # лимит Telegram — 4096 символов
+        await cb.message.answer(text[i:i + 4000], parse_mode="HTML")
+    await cb.message.answer("ℹ️ Данные обновляются, когда сервер сохраняет игрока (при выходе и раз в несколько минут).")
 
 
 @router.message(F.text == "🖥 Сервер")
