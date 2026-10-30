@@ -28,7 +28,9 @@ logging.basicConfig(level=logging.INFO)
 
 # ───────────────────────── Конфиг ─────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.lstrip("-").isdigit()}
+if not ADMIN_IDS:
+    logging.warning("ADMIN_IDS пуст или не числовой: заявки на донат некому отправлять. Узнай ID командой /myid в боте.")
 
 SERVER_HOST = os.getenv("SERVER_HOST", "epyc2.worldhosts.fun")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "22180"))
@@ -58,12 +60,19 @@ STATS_DIRS = [x.strip() for x in os.getenv("SFTP_STATS_DIRS", f"{SFTP_STATS_DIR}
 PLAYERDATA_DIRS = [x.strip() for x in os.getenv("SFTP_PLAYERDATA_DIRS", "world/playerdata,world/players/data").split(",") if x.strip()]
 PLAYERDATA_LOCAL_DIR = os.getenv("PLAYERDATA_DIR", "playerdata")
 
-# RCON для выдачи привилегий
+# Выдача привилегий на сервере. Способ 1 (рекомендуется): API панели хостинга (Pterodactyl).
+PTERO_URL = os.getenv("PTERO_URL", "").rstrip("/")  # например https://auth.worldhosts.fun
+PTERO_API_KEY = os.getenv("PTERO_API_KEY", "")      # Аккаунт -> API Credentials
+PTERO_SERVER_ID = os.getenv("PTERO_SERVER_ID", "")  # короткий ID сервера из адреса /server/xxxxxxxx
+# Способ 2: RCON (если включён на сервере)
 RCON_HOST = os.getenv("RCON_HOST", SERVER_HOST)
 RCON_PORT = int(os.getenv("RCON_PORT", "25575"))
 RCON_PASSWORD = os.getenv("RCON_PASSWORD", "")
-# {nick} и {group} подставляются автоматически (пример для LuckPerms)
-RANK_COMMAND = os.getenv("RANK_COMMAND", "lp user {nick} parent set {group}")
+# {nick} и {group} подставляются автоматически (LuckPerms: добавить игроку группу)
+RANK_COMMAND = os.getenv("RANK_COMMAND", "lp user {nick} parent add {group}")
+# Сообщение всему серверу после выдачи ({nick} и {title}); пусто — не отправлять
+ANNOUNCE_COMMAND = os.getenv("ANNOUNCE_COMMAND", "say {nick} поддержал сервер и получил привилегию {title}!")
+FONT_FILE = Path(__file__).with_name("font.ttf")
 
 PAYMENT_DETAILS = os.getenv("PAYMENT_DETAILS", "Реквизиты для оплаты: укажи в .env (PAYMENT_DETAILS)")
 COMMUNITY_TEXT = os.getenv("COMMUNITY_TEXT", "Наше сообщество:")
@@ -363,66 +372,107 @@ def _font(size: int):
     from PIL import ImageFont
 
     try:
+        if FONT_FILE.exists():
+            return ImageFont.truetype(str(FONT_FILE), size)
         return ImageFont.load_default(size=size)
-    except TypeError:  # старый Pillow
+    except Exception:
         return ImageFont.load_default()
 
 
-def render_slots(slots: dict[int, tuple[str, int]], layout: list[list[int | None]]) -> bytes:
-    """Рисует сетку слотов. layout — строки со списком номеров слотов (None — пустое место)."""
+RANK_COLORS = {"Креатив": (67, 160, 71), "Модератор": (30, 136, 229), "Админ": (229, 57, 53)}
+
+
+def _draw_slot(img, d, x, y, item, cell=64):
+    """Один слот в тёмном стиле с фаской; item = (id, count) или None."""
+    from PIL import Image
+
+    d.rectangle([x, y, x + cell - 1, y + cell - 1], fill=(62, 62, 70, 255))
+    d.line([x, y, x + cell - 1, y], fill=(28, 28, 34, 255), width=3)
+    d.line([x, y, x, y + cell - 1], fill=(28, 28, 34, 255), width=3)
+    d.line([x, y + cell - 1, x + cell - 1, y + cell - 1], fill=(104, 104, 114, 255), width=2)
+    d.line([x + cell - 1, y, x + cell - 1, y + cell - 1], fill=(104, 104, 114, 255), width=2)
+    if item is None:
+        return
+    item_id, count = item
+    icon_px = 48
+    ic = _icon_for(item_id)
+    ix, iy = x + (cell - icon_px) // 2, y + (cell - icon_px) // 2
+    if ic is not None:
+        img.alpha_composite(ic.resize((icon_px, icon_px), Image.NEAREST), (ix, iy))
+    else:  # иконки нет — цветная плитка с буквами названия
+        hsh = sum(ord(ch) for ch in item_id)
+        color = (70 + hsh * 7 % 130, 70 + hsh * 13 % 130, 70 + hsh * 29 % 130, 255)
+        d.rounded_rectangle([ix, iy, ix + icon_px, iy + icon_px], radius=8, fill=color)
+        short = item_id.split(":", 1)[-1].replace("_", " ")
+        d.text((ix + icon_px // 2, iy + icon_px // 2), short[:2].upper(), fill="white", font=_font(18), anchor="mm")
+    if count > 1:
+        d.text((x + cell - 5, y + cell - 3), str(count), fill="white", font=_font(18), anchor="rd",
+               stroke_width=2, stroke_fill=(20, 20, 24, 255))
+
+
+def render_card(nick: str, ranks: list[str], data: dict) -> bytes:
+    """Одна красивая картинка: игрок, донаты, броня, инвентарь, хотбар, эндер-сундук, координаты."""
     import io
 
     from PIL import Image, ImageDraw
 
-    cell, pad, icon_px = 64, 8, 48
-    cols = max(len(r) for r in layout)
-    w = cols * cell + pad * 2
-    h = len(layout) * cell + pad * 2
-    img = Image.new("RGBA", (w, h), (198, 198, 198, 255))
+    cell, W, M = 64, 640, 32
+    inv = {s: (i, c) for s, i, c in data["inv"]}
+    ender = {s: (i, c) for s, i, c in data["ender"]}
+    sections = [
+        ("Броня и левая рука", [[103, 102, 101, 100, None, -106]], inv),
+        ("Инвентарь", [[9 + r * 9 + c for c in range(9)] for r in range(3)], inv),
+        ("Хотбар", [list(range(9))], inv),
+        ("Эндер-сундук", [[r * 9 + c for c in range(9)] for r in range(3)], ender),
+    ]
+    header_h, label_h, gap, footer_h = 118, 36, 12, 112
+    H = header_h + sum(label_h + len(rows) * cell + gap for _, rows, _ in sections) + footer_h
+
+    img = Image.new("RGBA", (W, H))
     d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, w - 1, h - 1], outline=(85, 85, 85, 255), width=3)
-    font = _font(20)
-    for r, row in enumerate(layout):
-        for c, slot in enumerate(row):
-            if slot is None:
-                continue
-            x, y = pad + c * cell, pad + r * cell
-            d.rectangle([x, y, x + cell - 2, y + cell - 2], fill=(139, 139, 139, 255), outline=(55, 55, 55, 255), width=2)
-            if slot not in slots:
-                continue
-            item_id, count = slots[slot]
-            ic = _icon_for(item_id)
-            if ic is not None:
-                ic = ic.resize((icon_px, icon_px), Image.NEAREST)
-                img.alpha_composite(ic, (x + (cell - icon_px) // 2 - 1, y + (cell - icon_px) // 2 - 1))
-            else:  # иконки нет — плитка с буквами названия
-                hsh = sum(ord(ch) for ch in item_id)
-                color = (60 + hsh * 7 % 140, 60 + hsh * 13 % 140, 60 + hsh * 29 % 140, 255)
-                d.rectangle([x + 8, y + 8, x + cell - 10, y + cell - 10], fill=color)
-                short = item_id.split(":", 1)[-1].replace("_", " ")
-                d.text((x + cell // 2 - 1, y + cell // 2 - 1), short[:2].upper(), fill="white", font=font, anchor="mm")
-            if count > 1:
-                tx, ty = x + cell - 6, y + cell - 4
-                d.text((tx + 2, ty + 2), str(count), fill=(55, 55, 55, 255), font=font, anchor="rd")
-                d.text((tx, ty), str(count), fill="white", font=font, anchor="rd")
+    for yy in range(H):  # вертикальный градиент фона
+        t = yy / H
+        d.line([0, yy, W, yy], fill=(int(34 - 14 * t), int(36 - 14 * t), int(52 - 20 * t), 255))
+
+    # шапка
+    d.rounded_rectangle([M - 8, 16, W - M + 8, header_h - 12], radius=16, fill=(48, 50, 68, 255))
+    d.text((M, 26), nick, font=_font(34), fill="white")
+    px = M
+    for name in (ranks or ["Игрок"]):
+        color = RANK_COLORS.get(name, (110, 110, 120))
+        fnt = _font(17)
+        tw = int(d.textlength(name, font=fnt))
+        d.rounded_rectangle([px, 72, px + tw + 24, 72 + 28], radius=14, fill=color + (255,))
+        d.text((px + 12, 72 + 14), name, font=fnt, fill="white", anchor="lm")
+        px += tw + 24 + 10
+
+    # разделы
+    y = header_h
+    for title, rows, source in sections:
+        d.rounded_rectangle([M, y + 8, M + 5, y + 28], radius=2, fill=(255, 193, 7, 255))
+        d.text((M + 14, y + 18), title, font=_font(20), fill=(230, 230, 240, 255), anchor="lm")
+        y += label_h
+        for r, row in enumerate(rows):
+            for c, slot in enumerate(row):
+                if slot is None:
+                    continue
+                _draw_slot(img, d, M + c * cell, y + r * cell, source.get(slot), cell)
+        y += len(rows) * cell + gap
+
+    # подвал: координаты и счётчики
+    main_items = [t for t in data["inv"] if t[0] not in (103, 102, 101, 100, -106)]
+    total = sum(c for _, _, c in main_items)
+    e_total = sum(c for _, _, c in data["ender"])
+    d.line([M - 8, y + 6, W - M + 8, y + 6], fill=(80, 82, 100, 255), width=2)
+    small = _font(17)
+    d.text((M, y + 20), f"Спавн: {data['spawn'] or 'не задан'}", font=small, fill=(210, 210, 225, 255))
+    d.text((M, y + 46), f"Позиция: {data['pos'] or 'неизвестна'}", font=small, fill=(210, 210, 225, 255))
+    d.text((M, y + 72), f"Предметов в инвентаре: {total}   ·   в эндер-сундуке: {e_total}",
+           font=small, fill=(255, 213, 79, 255))
+
     out = io.BytesIO()
     img.convert("RGB").save(out, "PNG", optimize=True)
     return out.getvalue()
-
-
-def render_inventory(items: list[tuple[int, str, int]]) -> bytes:
-    slots = {s: (i, c) for s, i, c in items}
-    layout = [
-        [103, 102, 101, 100, None, -106, None, None, None],  # шлем, нагрудник, поножи, ботинки, левая рука
-        *[[9 + r * 9 + c for c in range(9)] for r in range(3)],  # основной инвентарь
-        [0, 1, 2, 3, 4, 5, 6, 7, 8],  # хотбар
-    ]
-    return render_slots(slots, layout)
-
-
-def render_ender(items: list[tuple[int, str, int]]) -> bytes:
-    slots = {s: (i, c) for s, i, c in items}
-    return render_slots(slots, [[r * 9 + c for c in range(9)] for r in range(3)])
 
 
 def _items_of(lst) -> list[tuple[int, str, int]]:
@@ -524,6 +574,42 @@ def _rcon(cmd: str) -> str:
 
     with MCRcon(RCON_HOST, RCON_PASSWORD, port=RCON_PORT) as m:
         return m.command(cmd)
+
+
+def _ptero_command(cmd: str) -> str:
+    """Отправляет команду в консоль сервера через API панели Pterodactyl."""
+    import urllib.request
+
+    req = urllib.request.Request(
+        f"{PTERO_URL}/api/client/servers/{PTERO_SERVER_ID}/command",
+        data=json.dumps({"command": cmd}).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {PTERO_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return f"HTTP {resp.status}"
+
+
+def run_server_command(cmd: str) -> str:
+    """Выполняет команду на Minecraft-сервере: через панель хостинга, иначе через RCON."""
+    if PTERO_URL and PTERO_API_KEY and PTERO_SERVER_ID:
+        return _ptero_command(cmd)
+    if RCON_PASSWORD:
+        return _rcon(cmd)
+    raise RuntimeError("Не настроена выдача: заполни PTERO_URL/PTERO_API_KEY/PTERO_SERVER_ID или RCON_PASSWORD")
+
+
+def get_user_ranks(tg_id: int) -> list[str]:
+    """Названия купленных (выданных) привилегий пользователя."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT DISTINCT rank FROM donations WHERE tg_id=? AND status='done'", (tg_id,)
+        ).fetchall()
+    return [RANKS[r["rank"]][0] for r in rows if r["rank"] in RANKS]
 
 
 # ───────────────────────── Клавиатуры ─────────────────────────
@@ -628,9 +714,25 @@ async def profile(m: Message):
         ).replace(",", " ")
     else:
         text += "Статистика пока недоступна (игрок ещё не играл или не настроен доступ к stats)."
+    ranks = get_user_ranks(m.from_user.id)
+    text += f"\n💎 Донат: <b>{', '.join(ranks) if ranks else 'нет'}</b>"
     kb = InlineKeyboardBuilder()
     kb.button(text="🎒 Инвентарь", callback_data="inv")
+    if not ranks:
+        kb.button(text="💎 Купить донат", callback_data="gotodonate")
+    kb.adjust(1)
     await m.answer(text, parse_mode="HTML", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "gotodonate")
+async def goto_donate(cb: CallbackQuery):
+    await cb.answer()
+    await _show_donate(cb.message, cb.from_user.id)
+
+
+@router.message(Command("myid"))
+async def myid(m: Message):
+    await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>", parse_mode="HTML")
 
 
 @router.callback_query(F.data == "inv")
@@ -653,13 +755,10 @@ async def inventory(cb: CallbackQuery):
             "если уже заходил — администратору нужно проверить доступ по SFTP."
         )
         return
-    try:  # картинки (если не получилось — остаётся текстовый список ниже)
-        inv_png, ender_png = await asyncio.gather(
-            asyncio.to_thread(render_inventory, data["inv"]),
-            asyncio.to_thread(render_ender, data["ender"]),
-        )
-        await cb.message.answer_photo(BufferedInputFile(inv_png, "inventory.png"), caption=f"🎒 Инвентарь {user['nick']}")
-        await cb.message.answer_photo(BufferedInputFile(ender_png, "ender.png"), caption="🟣 Эндер-сундук")
+    try:  # картинка-карточка (если не получилось — остаётся текстовый список ниже)
+        ranks = get_user_ranks(cb.from_user.id)
+        png = await asyncio.to_thread(render_card, user["nick"], ranks, data)
+        await cb.message.answer_photo(BufferedInputFile(png, "inventory.png"), caption=f"🎒 {user['nick']}")
     except Exception:
         logging.exception("render failed")
     text = format_inventory(user["nick"], data)
@@ -674,22 +773,35 @@ async def server(m: Message):
     await m.answer(await server_status())
 
 
+ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@s1hum1")
+
+
+async def _show_donate(message: Message, user_id: int):
+    if not get_user(user_id):
+        await message.answer("Сначала зарегистрируйся: /register")
+        return
+    owned = get_user_ranks(user_id)
+    kb = InlineKeyboardBuilder()
+    for key, (title, price, _) in RANKS.items():
+        mark = "✅ " if title in owned else ""
+        kb.button(text=f"{mark}{title} — {price} ₽", callback_data=f"don:{key}")
+    kb.adjust(1)
+    head = f"💎 Твой донат: <b>{', '.join(owned)}</b>\n\n" if owned else ""
+    await message.answer(head + "Выбери привилегию:", parse_mode="HTML", reply_markup=kb.as_markup())
+
+
 @router.message(F.text == "💎 Донат")
 @router.message(Command("donate"))
 async def donate(m: Message):
-    if not get_user(m.from_user.id):
-        await m.answer("Сначала зарегистрируйся: /register")
-        return
-    kb = InlineKeyboardBuilder()
-    for key, (title, price, _) in RANKS.items():
-        kb.button(text=f"{title} — {price} ₽", callback_data=f"don:{key}")
-    kb.adjust(1)
-    await m.answer("💎 Выбери привилегию:", reply_markup=kb.as_markup())
+    await _show_donate(m, m.from_user.id)
 
 
 @router.callback_query(F.data.startswith("don:"))
 async def donate_pick(cb: CallbackQuery):
     key = cb.data.split(":")[1]
+    if key not in RANKS:
+        await cb.answer()
+        return
     title, price, _ = RANKS[key]
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Я оплатил", callback_data=f"paid:{key}")
@@ -705,31 +817,54 @@ async def donate_pick(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("paid:"))
 async def donate_paid(cb: CallbackQuery, bot: Bot):
     key = cb.data.split(":")[1]
+    if key not in RANKS:
+        await cb.answer()
+        return
     title, price, _ = RANKS[key]
     user = get_user(cb.from_user.id)
     if not user:
         await cb.answer("Сначала /register", show_alert=True)
         return
     with db() as c:
+        dup = c.execute(
+            "SELECT id FROM donations WHERE tg_id=? AND rank=? AND status IN ('pending','processing')",
+            (cb.from_user.id, key),
+        ).fetchone()
+        if dup:
+            await cb.answer(f"Заявка #{dup['id']} уже отправлена, ожидай подтверждения.", show_alert=True)
+            return
         cur = c.execute(
             "INSERT INTO donations (tg_id, nick, rank, amount) VALUES (?, ?, ?, ?)",
             (cb.from_user.id, user["nick"], key, price),
         )
         did = cur.lastrowid
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Выдать", callback_data=f"ok:{did}")
+    kb.button(text="✅ Подтвердить и выдать", callback_data=f"ok:{did}")
     kb.button(text="❌ Отклонить", callback_data=f"no:{did}")
+    kb.adjust(1)
+    username = f"@{cb.from_user.username}" if cb.from_user.username else "без username"
+    delivered = 0
     for admin in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin,
-                f"💰 Заявка #{did}\nИгрок: {user['nick']} (@{cb.from_user.username})\n"
-                f"Привилегия: {title} — {price} ₽",
+                f"💰 Новая заявка на донат #{did}\n\n"
+                f"👤 Ник в игре: {user['nick']}\n"
+                f"✈️ Telegram: {username} (id {cb.from_user.id})\n"
+                f"💎 Привилегия: {title}\n"
+                f"💵 Сумма: {price} ₽\n\n"
+                "Проверь, что оплата пришла, и нажми «Подтвердить» — привилегия выдастся на сервере сама.",
                 reply_markup=kb.as_markup(),
             )
+            delivered += 1
         except Exception:
-            logging.exception("notify admin failed")
-    await cb.message.answer(f"Заявка #{did} отправлена админам. Ожидай подтверждения.")
+            logging.exception("notify admin failed (admin id %s)", admin)
+    if delivered:
+        await cb.message.answer(f"Заявка #{did} отправлена админу. Привилегия «{title}» будет выдана после проверки оплаты.")
+    else:
+        await cb.message.answer(
+            f"Заявка #{did} создана, но уведомление админу не дошло. Напиши {ADMIN_CONTACT} и назови номер заявки."
+        )
     await cb.answer()
 
 
@@ -739,28 +874,38 @@ async def donate_decide(cb: CallbackQuery, bot: Bot):
         await cb.answer("Только для админов", show_alert=True)
         return
     action, did = cb.data.split(":")
-    with db() as c:
+    new_status = "rejected" if action == "no" else "processing"
+    with db() as c:  # атомарно «занимаем» заявку, чтобы двойной клик не выдал донат дважды
+        cur = c.execute("UPDATE donations SET status=? WHERE id=? AND status='pending'", (new_status, int(did)))
+        claimed = cur.rowcount == 1
         row = c.execute("SELECT * FROM donations WHERE id=?", (int(did),)).fetchone()
-        if not row or row["status"] != "pending":
-            await cb.answer("Заявка уже обработана", show_alert=True)
-            return
-        if action == "no":
-            c.execute("UPDATE donations SET status='rejected' WHERE id=?", (row["id"],))
-            await bot.send_message(row["tg_id"], f"❌ Заявка #{did} отклонена. Если это ошибка — напиши админу.")
-            await cb.message.edit_text(cb.message.text + "\n\n❌ Отклонено")
-            await cb.answer()
-            return
+    if not claimed or not row:
+        await cb.answer("Заявка уже обработана", show_alert=True)
+        return
+    if action == "no":
+        await bot.send_message(row["tg_id"], f"❌ Заявка #{did} отклонена. Если это ошибка — напиши {ADMIN_CONTACT}.")
+        await cb.message.edit_text(cb.message.text + "\n\n❌ Отклонено")
+        await cb.answer()
+        return
     title, _, group = RANKS[row["rank"]]
     try:
-        await asyncio.to_thread(_rcon, RANK_COMMAND.format(nick=row["nick"], group=group))
+        await asyncio.to_thread(run_server_command, RANK_COMMAND.format(nick=row["nick"], group=group))
     except Exception as e:
-        await cb.answer(f"Ошибка RCON: {e}", show_alert=True)
+        logging.exception("grant failed")
+        with db() as c:  # вернуть в очередь, чтобы можно было нажать ещё раз
+            c.execute("UPDATE donations SET status='pending' WHERE id=?", (row["id"],))
+        await cb.answer(f"Не удалось выдать на сервере: {type(e).__name__}: {e}"[:190], show_alert=True)
         return
+    if ANNOUNCE_COMMAND:
+        try:
+            await asyncio.to_thread(run_server_command, ANNOUNCE_COMMAND.format(nick=row["nick"], title=title))
+        except Exception:
+            logging.exception("announce failed")
     with db() as c:
         c.execute("UPDATE donations SET status='done' WHERE id=?", (row["id"],))
-    await bot.send_message(row["tg_id"], f"🎉 Привилегия «{title}» выдана на сервере! Спасибо за поддержку.")
-    await cb.message.edit_text(cb.message.text + "\n\n✅ Выдано")
-    await cb.answer()
+    await bot.send_message(row["tg_id"], f"🎉 Привилегия «{title}» выдана на сервере! Спасибо за поддержку. Перезайди в игру, если права не появились сразу.")
+    await cb.message.edit_text(cb.message.text + "\n\n✅ Выдано на сервере")
+    await cb.answer("Выдано!")
 
 
 @router.message(F.text == "👥 Сообщество")

@@ -5,3 +5,4 @@ bcrypt>=4.0
 pymysql>=1.1
 paramiko>=3.4
 Pillow>=10.1
+mcrcon>=0.7
